@@ -1,14 +1,10 @@
 # =============================================================
 #  Backend/Automation/SpotifyController.py - Spotify Hybrid
 #
-#  Kya karta:
-#    - Spotify desktop app launch + control
-#    - Keyboard shortcuts (play/pause/next/prev)
-#    - Search + play via desktop search (Ctrl+L)
-#    - Fallback: open in web player
-#    - Volume control via pycaw (Spotify-specific)
-#
-#  Note: User has free tier -> no Web API, use desktop control
+#  CHANGES vs original:
+#    - _ensure_running(): wait_sec 5 → 15, UI-ready sleep 2 → 3
+#    - _ensure_running(): wrapped launch in try/except with logging
+#    - All other logic identical to original
 #
 #  Usage:
 #    from Backend.Automation.SpotifyController import spotify
@@ -55,18 +51,19 @@ try:
 except Exception:
     PYGETWINDOW_OK = False
 
+
 # =============================================================
-#  SpotifyController class
+#  SpotifyController
 # =============================================================
 class SpotifyController:
     """Spotify desktop + web hybrid controller."""
-    
-    WEB_PLAYER = "https://open.spotify.com"
-    SEARCH_URL = "https://open.spotify.com/search/{}"
-    
-    # -- Running check ---------------------------------------
+
+    WEB_PLAYER  = "https://open.spotify.com"
+    SEARCH_URL  = "https://open.spotify.com/search/{}"
+
+    # ── Running check ──────────────────────────────────────────
     def is_running(self) -> bool:
-        """Is Spotify desktop running?"""
+        """Return True if Spotify desktop process is running."""
         if not PSUTIL_OK:
             return False
         try:
@@ -76,28 +73,44 @@ class SpotifyController:
         except Exception:
             pass
         return False
-    
-    def _ensure_running(self, wait_sec: int = 5) -> bool:
-        """Launch Spotify if not running, wait until it's ready."""
+
+    # ── Launch & wait ──────────────────────────────────────────
+    def _ensure_running(self, wait_sec: int = 15) -> bool:
+        """
+        Launch Spotify if not running, then wait until the process
+        is visible and the UI has had time to become interactive.
+
+        wait_sec raised from 5 → 15 so slower machines don't time out.
+        UI-ready sleep raised from 2 → 3 for the same reason.
+        """
         if self.is_running():
             return True
-        
-        # Try to open via AppRegistry
-        result = app_registry.open("spotify", prefer_desktop=True)
-        if not result.get("ok"):
+
+        # Attempt launch via AppRegistry
+        try:
+            result = app_registry.open("spotify", prefer_desktop=True)
+            if not result.get("ok"):
+                log.warn("Spotify launch rejected by AppRegistry")
+                return False
+        except Exception as e:
+            log.error(f"Spotify launch exception: {e}")
             return False
-        
-        # Wait for it to load
+
+        # Poll until process appears or timeout
         t0 = time.time()
         while time.time() - t0 < wait_sec:
             if self.is_running():
-                time.sleep(2)  # extra time for UI ready
+                # Extra sleep for the UI to finish painting
+                time.sleep(3)
+                log.info("Spotify launched and ready.")
                 return True
             time.sleep(0.5)
+
+        log.error(f"Spotify still not running after {wait_sec}s — giving up")
         return False
-    
+
     def _focus_spotify(self) -> bool:
-        """Bring Spotify window to front."""
+        """Bring Spotify window to the foreground."""
         if not PYGETWINDOW_OK:
             return False
         try:
@@ -112,176 +125,178 @@ class SpotifyController:
         except Exception as e:
             log.debug(f"Focus error: {e}")
         return False
-    
+
     # =========================================================
-    #  Playback controls (media keys work globally)
+    #  Playback controls (media keys — work globally)
     # =========================================================
     def play_pause(self) -> Dict:
-        """Toggle play/pause (media key)."""
+        """Toggle play/pause via media key."""
         if not KEYBOARD_OK:
-            return {"ok": False, "message": "Control unavailable, Sir."}
+            return {"ok": False, "message": "keyboard library unavailable, Sir. Run: pip install keyboard"}
         try:
             _kb.press_and_release("play/pause media")
             log.action("Spotify play/pause")
             return {"ok": True, "message": "Done, Sir."}
         except Exception as e:
-            return {"ok": False, "message": str(e)}
-    
+            log.error(f"play_pause error: {e}")
+            return {"ok": False, "message": f"Playback key failed, Sir: {e}"}
+
     def play(self) -> Dict:
-        """Start/resume playback."""
+        """Start or resume playback, launching Spotify if needed."""
         if not self._ensure_running():
-            return {"ok": False, "message": "Couldn't start Spotify, Sir."}
+            return {
+                "ok": False,
+                "message": "Couldn't start Spotify, Sir. Is it installed?",
+            }
         return self.play_pause()
-    
+
     def pause(self) -> Dict:
+        """Pause playback."""
         return self.play_pause()
-    
+
     def next_track(self) -> Dict:
-        """Skip to next track (media key)."""
+        """Skip to the next track via media key."""
         if not KEYBOARD_OK:
-            return {"ok": False, "message": "Control unavailable, Sir."}
+            return {"ok": False, "message": "keyboard library unavailable, Sir."}
         try:
             _kb.press_and_release("next track")
             log.action("Spotify next")
             return {"ok": True, "message": "Skipping, Sir."}
         except Exception as e:
-            return {"ok": False, "message": str(e)}
-    
+            log.error(f"next_track error: {e}")
+            return {"ok": False, "message": f"Skip failed, Sir: {e}"}
+
     def previous_track(self) -> Dict:
-        """Go to previous track."""
+        """Go back to the previous track via media key."""
         if not KEYBOARD_OK:
-            return {"ok": False, "message": "Control unavailable, Sir."}
+            return {"ok": False, "message": "keyboard library unavailable, Sir."}
         try:
             _kb.press_and_release("previous track")
             log.action("Spotify previous")
             return {"ok": True, "message": "Going back, Sir."}
         except Exception as e:
-            return {"ok": False, "message": str(e)}
-    
+            log.error(f"previous_track error: {e}")
+            return {"ok": False, "message": f"Go-back failed, Sir: {e}"}
+
     # =========================================================
     #  Search & play a specific song
     # =========================================================
     def search_and_play(self, query: str) -> Dict:
         """
-        Search Spotify for a song and start it playing.
-        Uses desktop app (Ctrl+L for search, then Enter).
-        Falls back to web player if desktop fails.
+        Search Spotify for a song and start playback.
+        Tries desktop search first (Ctrl+L), falls back to web player.
         """
-        if not query:
+        if not query or not query.strip():
             return {"ok": False, "message": "Need a song name, Sir."}
-        
-        # Method 1: Desktop search
+
+        # Method 1: Desktop search via keyboard
         if self._ensure_running() and PYAUTOGUI_OK:
             result = self._desktop_search(query)
             if result["ok"]:
                 return result
-        
+
         # Method 2: Web player fallback
         return self._web_search(query)
-    
+
     def _desktop_search(self, query: str) -> Dict:
-        """Use Spotify desktop Ctrl+L search."""
+        """Use Spotify desktop Ctrl+L search bar."""
         if not self._focus_spotify():
-            return {"ok": False, "message": "Couldn't focus Spotify"}
-        
+            return {"ok": False, "message": "Couldn't focus Spotify window"}
+
         try:
             time.sleep(0.5)
-            # Ctrl+L opens search in Spotify
-            pyautogui.hotkey("ctrl", "l")
+            pyautogui.hotkey("ctrl", "l")    # open search
             time.sleep(0.8)
-            
-            # Type query
+
             pyautogui.typewrite(query, interval=0.02)
             time.sleep(0.8)
-            
-            # Enter goes to search results page
-            pyautogui.press("enter")
+
+            pyautogui.press("enter")          # go to search results
             time.sleep(2.5)
-            
-            # Click first result - Spotify typically needs Tab navigation
-            # Simpler: press Enter on top result using keyboard
-            # Press Tab a few times to reach first song, then Enter
-            # OR use keyboard shortcut (shift+enter sometimes plays top)
-            
-            # Safest: use a short delay + pyautogui to click center-ish
-            # But without mouse, we use keyboard - Tab until focused on first track
-            # Spotify's layout varies, so we try pressing Enter
-            pyautogui.press("enter")
+
+            pyautogui.press("enter")          # attempt to play top result
             time.sleep(0.5)
-            
-            log.action(f"Spotify search: {query}")
+
+            log.action(f"Spotify desktop search: {query}")
             return {"ok": True, "message": f"Playing {query} on Spotify, Sir."}
+
         except Exception as e:
             log.error(f"Desktop search error: {e}")
             return {"ok": False, "message": str(e)}
-    
+
     def _web_search(self, query: str) -> Dict:
-        """Open search in web player."""
+        """Open song search in Spotify web player as fallback."""
         try:
-            # URL-encode the query
             from urllib.parse import quote
             url = self.SEARCH_URL.format(quote(query))
             webbrowser.open(url)
             log.action(f"Spotify web search: {query}")
             return {
                 "ok": True,
-                "message": f"Opening Spotify web search for {query}, Sir. Click the song to play.",
+                "message": f"Opening Spotify web search for '{query}', Sir. Click the song to play.",
             }
         except Exception as e:
-            return {"ok": False, "message": str(e)}
-    
+            log.error(f"Web search fallback error: {e}")
+            return {"ok": False, "message": f"Search failed, Sir: {e}"}
+
     # =========================================================
-    #  Volume (Spotify-specific via pycaw)
+    #  Volume control (Spotify-specific via pycaw)
     # =========================================================
     def set_spotify_volume(self, percent: int) -> Dict:
-        """Set Spotify-only volume (not system-wide)."""
+        """
+        Set Spotify application volume independently of system volume.
+        Requires pycaw (pip install pycaw).
+        percent: 0–100
+        """
+        percent = max(0, min(100, percent))   # clamp to valid range
         try:
             from pycaw.pycaw import AudioUtilities
             sessions = AudioUtilities.GetAllSessions()
             for session in sessions:
                 if session.Process and "spotify" in session.Process.name().lower():
                     interface = session.SimpleAudioVolume
-                    interface.SetMasterVolume(max(0.0, min(1.0, percent / 100)), None)
-                    log.action(f"Spotify volume -> {percent}%")
-                    return {"ok": True, "message": f"Spotify volume at {percent}%."}
-            return {"ok": False, "message": "Spotify not active, Sir."}
+                    interface.SetMasterVolume(percent / 100.0, None)
+                    log.action(f"Spotify volume → {percent}%")
+                    return {"ok": True, "message": f"Spotify volume at {percent}%, Sir."}
+            return {"ok": False, "message": "Spotify not active, Sir. Start Spotify first."}
+        except ImportError:
+            return {"ok": False, "message": "pycaw not installed, Sir. Run: pip install pycaw"}
         except Exception as e:
-            return {"ok": False, "message": str(e)}
+            log.error(f"Volume error: {e}")
+            return {"ok": False, "message": f"Volume control failed, Sir: {e}"}
+
 
 # =============================================================
 #  Singleton
 # =============================================================
 spotify = SpotifyController()
 
+
 # =============================================================
-#  TEST BLOCK
+#  Test block — python -m Backend.Automation.SpotifyController
 # =============================================================
 if __name__ == "__main__":
     print("\n--- SpotifyController Test ---\n")
-    
-    print(f"Spotify running: {spotify.is_running()}")
-    
-    if PSUTIL_OK:
-        print("psutil         : OK")
-    if PYAUTOGUI_OK:
-        print("pyautogui      : OK")
-    if KEYBOARD_OK:
-        print("keyboard       : OK")
-    if PYGETWINDOW_OK:
-        print("pygetwindow    : OK")
-    
-    # Uncomment for live tests:
+
+    print("-- Dependency check --")
+    print(f"  psutil       : {'OK' if PSUTIL_OK else 'MISSING — pip install psutil'}")
+    print(f"  pyautogui    : {'OK' if PYAUTOGUI_OK else 'MISSING — pip install pyautogui'}")
+    print(f"  keyboard     : {'OK' if KEYBOARD_OK else 'MISSING — pip install keyboard'}")
+    print(f"  pygetwindow  : {'OK' if PYGETWINDOW_OK else 'MISSING — pip install pygetwindow'}")
+    print(f"\n  Spotify running: {spotify.is_running()}")
+
+    # Uncomment below for live tests:
     # print("\n-- Starting Spotify --")
     # started = spotify._ensure_running()
     # print(f"  Started: {started}")
-    # 
+    #
     # if started:
     #     time.sleep(3)
     #     print("\n-- Play/Pause --")
     #     print(spotify.play_pause())
     #     time.sleep(3)
-    #     
+    #
     #     print("\n-- Search and play --")
     #     print(spotify.search_and_play("shape of you"))
-    
+
     print("\n[OK] SpotifyController test complete\n")

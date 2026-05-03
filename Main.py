@@ -1,11 +1,15 @@
 # =============================================================
-#  Main.py - JARVIS V2 Orchestrator (WORKING VERSION)
+#  Main.py - JARVIS V3 Orchestrator
 #
-#  - STT handles wake word internally (already strips "jarvis")
-#  - Main.py just processes the clean command
-#  - Tuple-safe, bulletproof error handling
-#  - Wake word: "jarvis" (handled by STT)
-#  - Exit: Ctrl+C or "jarvis goodbye"
+#  Changes vs V2:
+#    - Text input wired: GUI.text_from_gui → _process_command_from_gui
+#    - _process_command_from_gui() added (runs in background thread)
+#    - _listen_loop: voice path skips add_user_message (ChatPanel handles it)
+#    - Version label updated to V3
+#
+#  Voice path:  STT → _listen_loop → add_user_message → _process_command
+#  Text path:   ChatPanel → text_submitted → GUI.text_from_gui
+#               → _process_command_from_gui (bg thread) → _process_command
 # =============================================================
 
 import sys
@@ -87,17 +91,13 @@ log = get_logger("Main")
 #  HELPERS - Defensive type conversion
 # =============================================================
 def _to_str(value: Any) -> str:
-    """Convert any return (tuple, str, None, etc.) to clean string."""
+    """Convert any return value (tuple, str, None, etc.) to a clean string."""
     if value is None:
         return ""
     if isinstance(value, tuple):
-        if len(value) > 0:
-            return _to_str(value[0])
-        return ""
+        return _to_str(value[0]) if len(value) > 0 else ""
     if isinstance(value, list):
-        if len(value) > 0:
-            return _to_str(value[0])
-        return ""
+        return _to_str(value[0]) if len(value) > 0 else ""
     if isinstance(value, str):
         return value
     try:
@@ -107,7 +107,7 @@ def _to_str(value: Any) -> str:
 
 
 def _safe_dict_get(result: Any, key: str, default: str = "") -> str:
-    """Get key from possibly-dict result, fallback to default."""
+    """Get a key from a possibly-dict result, falling back to default."""
     if isinstance(result, dict):
         v = result.get(key, default)
         return _to_str(v) if v is not None else default
@@ -118,26 +118,29 @@ def _safe_dict_get(result: Any, key: str, default: str = "") -> str:
 #  JARVIS CORE
 # =============================================================
 class JarvisCore:
-    """Main orchestrator."""
+    """Main orchestrator for JARVIS V3."""
 
     def __init__(self):
-        self.gui                      = None
-        self.running                  = False
+        self.gui                       = None
+        self.running                   = False
         self.listen_thread: Optional[threading.Thread] = None
-        self._awaiting_password       = False
-        self._goodbye_said            = False
+        self._awaiting_password        = False
+        self._goodbye_said             = False
         self._previous_mode: Optional[Mode] = None
-        # Security-input state — set True while the SecurityInputDialog
-        # overlay is open so the voice loop pauses during keyboard entry.
-        self._awaiting_security_input = False
-        self._security_input_mode     = "url"   # "url" | "password" | "email"
+        # Security-input state — True while the SecurityInputDialog overlay is
+        # open so the voice listen loop pauses during keyboard entry.
+        self._awaiting_security_input  = False
+        self._security_input_mode      = "url"   # "url" | "password" | "email"
+        # Lock that serialises _process_command so voice + text paths never
+        # race against each other and produce interleaved output.
+        self._process_lock             = threading.Lock()
 
     # =========================================================
     #  STARTUP
     # =========================================================
     def startup(self):
         log.info("=" * 60)
-        log.info("  JARVIS V2 STARTING UP")
+        log.info("  JARVIS V3 STARTING UP")
         log.info("=" * 60)
 
         self.running = True
@@ -146,21 +149,30 @@ class JarvisCore:
         # IMMEDIATE (non-blocking) wiring — must happen before event loop
         # ------------------------------------------------------------------
 
-        # 4. GUI password wire
+        # Password dialog signals
         try:
             self.gui.password_submitted.connect(self._on_password_submitted)
             self.gui.password_cancelled.connect(self._on_password_cancelled)
         except Exception as e:
             log.debug(f"Password wire skip: {e}")
 
-        # Wire security-input signals so Main.py can react to the dialog
+        # Security-input dialog signals
         try:
             self.gui.security_input_submitted.connect(self._on_security_input)
             self.gui.security_input_cancelled.connect(self._on_security_input_cancelled)
         except Exception as e:
             log.debug(f"Security input wire skip: {e}")
 
-        # 5. TTS state callback
+        # Text-input from ChatPanel  ← NEW in V3
+        # GUI emits text_from_gui(str) when the user types + presses Enter.
+        # We spawn a background thread so the Qt event loop is never blocked.
+        try:
+            self.gui.text_from_gui.connect(self._process_command_from_gui)
+            log.info("Text input wired: GUI.text_from_gui → _process_command_from_gui")
+        except Exception as e:
+            log.debug(f"Text input wire skip: {e}")
+
+        # TTS state callback → animates speaking indicator in GUI
         try:
             tts.register_state_callback(self._on_tts_state)
         except Exception as e:
@@ -169,14 +181,12 @@ class JarvisCore:
         # ------------------------------------------------------------------
         # DEFERRED heavy init via QTimer.singleShot(0, …)
         #
-        # Problem: startup() runs synchronously BEFORE app.exec_() so any
-        # blocking call (net.is_online can take 2-5 s on slow networks,
-        # notif_listener.start spawns OS threads, etc.) freezes the GUI
-        # and makes the BootAnimation hang.
+        # startup() runs synchronously BEFORE app.exec_() so any blocking call
+        # (net.is_online can take 2-5s on slow networks, notif_listener.start
+        # spawns OS threads, etc.) would freeze the GUI and hang the BootAnimation.
         #
-        # Fix: QTimer.singleShot(0, …) queues the callable to run on the
-        # very first idle tick of the Qt event loop — by which time the
-        # window is already painted and the BootAnimation is running.
+        # QTimer.singleShot(0, …) queues the callable for the very first idle
+        # tick of the Qt event loop — by which time the window is already painted.
         # ------------------------------------------------------------------
         QTimer.singleShot(0, self._deferred_startup)
 
@@ -189,21 +199,20 @@ class JarvisCore:
         Creates the voice-listener thread and spawns the background-init
         thread for all blocking operations.
         """
-        # Voice listener thread — created here, started after BootAnimation
         self.listen_thread = threading.Thread(
             target=self._listen_loop,
             daemon=True,
             name="MainListener",
         )
 
-        # Post-boot greeting fires at 3.5 s (sync with BootAnimation length)
+        # Post-boot greeting at 3.5s (synced with BootAnimation length)
         QTimer.singleShot(3500, self._post_boot_greeting)
 
-        # Voice listener starts at 5.5 s (greeting has had time to begin)
+        # Voice listener starts at 5.5s (greeting has had time to begin)
         QTimer.singleShot(5500, self.listen_thread.start)
 
         # All blocking operations run in a daemon background thread so the
-        # BootAnimation and rest of the GUI stay fully responsive.
+        # BootAnimation and the rest of the GUI stay fully responsive.
         init_thread = threading.Thread(
             target=self._background_init,
             daemon=True,
@@ -218,7 +227,7 @@ class JarvisCore:
         Never accesses PyQt5 widgets directly; GUI updates go via QTimer
         or signals on the main thread.
         """
-        # 1. Net check — can block for several seconds on captive / slow networks
+        # 1. Net check
         try:
             online = bool(net.is_online())
         except Exception:
@@ -242,14 +251,14 @@ class JarvisCore:
         except Exception as e:
             log.debug(f"Net callback skip: {e}")
 
-        # 6. Notification listener (spawns OS-level threads — slow on some systems)
+        # 4. Notification listener
         if online:
             try:
                 notif_listener.start(on_notif=self._on_new_notif)
             except Exception as e:
                 log.debug(f"Notif listener skip: {e}")
 
-        # 7. Proactive check-in
+        # 5. Proactive check-in
         try:
             proactive_checkin.start(on_speak=self.speak)
         except Exception as e:
@@ -258,7 +267,7 @@ class JarvisCore:
         log.info("Background init complete.")
 
     def _post_boot_greeting(self):
-        """Iron Man greeting."""
+        """Iron Man-style greeting after boot."""
         try:
             unread = 0
             try:
@@ -274,12 +283,12 @@ class JarvisCore:
 
             self.gui.add_jarvis_message(greeting)
             self.speak(greeting)
-            self.gui.set_status("Say 'jarvis' + command")
+            self.gui.set_status("Say 'jarvis' + command  or  type below")
         except Exception as e:
             log.error(f"Greeting: {e}")
 
     # =========================================================
-    #  TTS -> GUI sync
+    #  TTS → GUI sync
     # =========================================================
     def _on_tts_state(self, speaking: bool):
         try:
@@ -290,7 +299,7 @@ class JarvisCore:
             log.debug(f"TTS->GUI: {e}")
 
     def speak(self, text: Any):
-        """Speak + mirror to GUI."""
+        """Speak via TTS and mirror text to the GUI chat panel."""
         text = _to_str(text)
         if not text.strip():
             return
@@ -354,7 +363,11 @@ class JarvisCore:
                     watched = False
                 if watched:
                     sender = _to_str(notif.get("title", ""))
-                    msg = f"New {app} from {sender}." if sender else f"New {app} notification."
+                    msg = (
+                        f"New {app} from {sender}."
+                        if sender
+                        else f"New {app} notification."
+                    )
                     try:
                         if not tts.is_speaking:
                             self.speak(msg)
@@ -364,32 +377,28 @@ class JarvisCore:
             log.error(f"Notif: {e}")
 
     # =========================================================
-    #  VOICE LISTEN LOOP (STT handles wake word internally)
+    #  VOICE LISTEN LOOP
     # =========================================================
     def _listen_loop(self):
+        """
+        Runs in MainListener daemon thread.
+        STT strips the wake word internally — we receive only the clean command.
+        """
         log.info("Voice listen loop started.")
-        log.info("STT handles wake word internally.")
 
         while self.running:
             try:
-                # Pause during password entry
-                if self._awaiting_password:
+                # Pause during overlay screens (user is typing)
+                if self._awaiting_password or self._awaiting_security_input:
                     time.sleep(0.5)
                     continue
 
-                # Pause while SecurityInputDialog is open — user is typing
-                if self._awaiting_security_input:
-                    time.sleep(0.5)
-                    continue
-
-                # Update GUI
                 try:
                     self.gui.set_listening(True)
                     self.gui.set_status("Listening...")
                 except Exception:
                     pass
 
-                # STT call - returns ONLY the command (wake word stripped)
                 raw_result = None
                 try:
                     raw_result = stt.listen()
@@ -403,155 +412,186 @@ class JarvisCore:
                 except Exception:
                     pass
 
-                # Safely extract string
                 command = _to_str(raw_result).strip()
-
                 if not command or len(command) < 2:
                     continue
 
-                log.info(f"COMMAND RECEIVED: '{command}'")
+                log.info(f"VOICE COMMAND: '{command}'")
 
-                # Show in GUI
+                # Show in GUI — voice path owns the user bubble
                 try:
                     self.gui.add_user_message(command)
                 except Exception as e:
                     log.debug(f"GUI msg: {e}")
 
-                # Self-echo filter
+                # Self-echo filter (ignores JARVIS's own TTS fed back through mic)
                 try:
                     if context.is_self_echo(command):
-                        log.debug(f"Self-echo: {command[:40]}")
+                        log.debug(f"Self-echo filtered: '{command[:40]}'")
                         continue
                 except Exception:
                     pass
 
-                # Process
-                log.action(f"PROCESSING: {command}")
+                log.action(f"PROCESSING (voice): {command}")
                 self._process_command(command)
 
             except Exception as e:
-                log.error(f"Listen loop: {e}")
+                log.error(f"Listen loop error: {e}")
                 time.sleep(1)
 
     # =========================================================
-    #  COMMAND PROCESSING
+    #  TEXT INPUT HANDLER  ← NEW IN V3
     # =========================================================
-    def _process_command(self, command: str):
-        """Main pipeline. GUI already has the message."""
+    def _process_command_from_gui(self, command: str):
+        """
+        Called on the Qt main thread when the user types in ChatPanel and
+        presses Enter.  ChatPanel has already added the user bubble, so we
+        must NOT call add_user_message() again (would cause a duplicate).
+
+        We spawn a background thread so the Qt event loop is never blocked
+        by API calls, Selenium automation, or TTS.
+        """
         command = _to_str(command).strip()
         if not command:
             return
 
-        log.action(f"User: {command}")
+        log.action(f"PROCESSING (text input): {command}")
 
-        try:
-            # GUI already updated in listen loop
-            self.gui.set_status("Thinking...")
+        t = threading.Thread(
+            target=self._process_command,
+            args=(command,),
+            daemon=True,
+            name="TextInputProcessor",
+        )
+        t.start()
 
-            # Context + activity
+    # =========================================================
+    #  COMMAND PROCESSING  (shared by voice + text paths)
+    # =========================================================
+    def _process_command(self, command: str):
+        """
+        Core pipeline.  Called with a clean command string.
+
+        Voice path:     _listen_loop calls this directly (already in bg thread).
+        Text path:      _process_command_from_gui spawns a thread → calls this.
+
+        NOTE: The GUI user-bubble is added by the *caller* in both cases.
+              Never call self.gui.add_user_message() inside this method.
+        """
+        command = _to_str(command).strip()
+        if not command:
+            return
+
+        # Serialise so a fast typist can't race the voice path
+        with self._process_lock:
+            log.action(f"User: {command}")
+
             try:
-                context.add_user(command)
-            except Exception:
-                pass
-            try:
-                proactive_checkin.register_activity()
-            except Exception:
-                pass
+                self.gui.set_status("Thinking...")
 
-            # EQ processing
-            eq_result = {}
-            try:
-                eq_result = eq.process(command) or {}
-            except Exception as e:
-                log.debug(f"EQ error: {e}")
-                eq_result = {}
-
-            # EQ early returns
-            if eq_result.get("is_adult"):
-                resp = _to_str(eq_result.get("adult_response", "Let's keep this professional, Sir."))
-                self.speak(resp)
-                self.gui.set_status("Ready")
-                return
-            if eq_result.get("is_gaali"):
-                resp = _to_str(eq_result.get("savage_response", "Watch it, Sir."))
-                self.speak(resp)
-                self.gui.set_status("Ready")
-                return
-            if eq_result.get("is_love"):
-                resp = _to_str(eq_result.get("love_response", "Noted, Sir."))
-                self.speak(resp)
-                self.gui.set_status("Ready")
-                return
-
-            # Route
-            routed_list = []
-            try:
-                routed_list = router.route(command) or []
-            except Exception as e:
-                log.debug(f"Router error: {e}")
-                routed_list = []
-
-            if not routed_list:
-                response = self._handle_general_chat(command, eq_result)
-                if response:
-                    try:
-                        context.add_jarvis(response)
-                    except Exception:
-                        pass
-                    self.speak(response)
-                self.gui.set_status("Ready")
-                return
-
-            # Process each intent
-            for routed in routed_list:
-                if not isinstance(routed, dict):
-                    continue
-
-                action = _to_str(routed.get("action", "general"))
-                target = _to_str(routed.get("target", ""))
-
-                log.info(f"Action={action} target={target}")
-
-                response = ""
+                # Context + activity
                 try:
-                    response = self._dispatch(action, target, command, routed, eq_result)
+                    context.add_user(command)
+                except Exception:
+                    pass
+                try:
+                    proactive_checkin.register_activity()
+                except Exception:
+                    pass
+
+                # EQ processing
+                eq_result = {}
+                try:
+                    eq_result = eq.process(command) or {}
                 except Exception as e:
-                    log.error(f"Dispatch error: {e}")
-                    response = "Something broke there, Sir. Try again?"
+                    log.debug(f"EQ error: {e}")
+                    eq_result = {}
 
-                response = _to_str(response).strip()
+                # EQ early returns
+                if eq_result.get("is_adult"):
+                    resp = _to_str(eq_result.get("adult_response", "Let's keep this professional, Sir."))
+                    self.speak(resp)
+                    self.gui.set_status("Ready")
+                    return
+                if eq_result.get("is_gaali"):
+                    resp = _to_str(eq_result.get("savage_response", "Watch it, Sir."))
+                    self.speak(resp)
+                    self.gui.set_status("Ready")
+                    return
+                if eq_result.get("is_love"):
+                    resp = _to_str(eq_result.get("love_response", "Noted, Sir."))
+                    self.speak(resp)
+                    self.gui.set_status("Ready")
+                    return
 
-                if response:
+                # Route
+                routed_list = []
+                try:
+                    routed_list = router.route(command) or []
+                except Exception as e:
+                    log.debug(f"Router error: {e}")
+                    routed_list = []
+
+                if not routed_list:
+                    response = self._handle_general_chat(command, eq_result)
+                    if response:
+                        try:
+                            context.add_jarvis(response)
+                        except Exception:
+                            pass
+                        self.speak(response)
+                    self.gui.set_status("Ready")
+                    return
+
+                # Process each intent
+                for routed in routed_list:
+                    if not isinstance(routed, dict):
+                        continue
+
+                    action = _to_str(routed.get("action", "general"))
+                    target = _to_str(routed.get("target", ""))
+
+                    log.info(f"Action={action}  target={target}")
+
+                    response = ""
                     try:
-                        context.add_jarvis(response)
-                    except Exception:
-                        pass
-                    self.speak(response)
+                        response = self._dispatch(action, target, command, routed, eq_result)
+                    except Exception as e:
+                        log.error(f"Dispatch error: {e}")
+                        response = "Something broke there, Sir. Try again?"
 
-            self.gui.set_status("Ready")
+                    response = _to_str(response).strip()
 
-            # Learning — only for non-command-style input (ContinuousLearner
-            # now guards against STT-capitalised command verbs internally too)
-            try:
-                continuous_learner.observe(command)
+                    if response:
+                        try:
+                            context.add_jarvis(response)
+                        except Exception:
+                            pass
+                        self.speak(response)
+
+                self.gui.set_status("Ready")
+
+                # Learning
+                try:
+                    continuous_learner.observe(command)
+                except Exception as e:
+                    log.debug(f"Learner: {e}")
+
             except Exception as e:
-                log.debug(f"Learner: {e}")
-
-        except Exception as e:
-            log.error(f"Process error: {e}")
-            try:
-                self.speak("Something went wrong, Sir. Please try again.")
-                self.gui.set_status("Error")
-                QTimer.singleShot(2000, lambda: self.gui.set_status("Ready"))
-            except Exception:
-                pass
+                log.error(f"Process error: {e}")
+                try:
+                    self.speak("Something went wrong, Sir. Please try again.")
+                    self.gui.set_status("Error")
+                    QTimer.singleShot(2000, lambda: self.gui.set_status("Ready"))
+                except Exception:
+                    pass
 
     # =========================================================
     #  DISPATCH
     # =========================================================
     def _dispatch(self, action: str, target: str, command: str,
                   routed: dict, eq_result: dict) -> str:
-        """Route action to handler."""
+        """Route action keyword to the correct handler."""
 
         action    = _to_str(action).lower()
         target    = _to_str(target)
@@ -587,11 +627,11 @@ class JarvisCore:
             except Exception:
                 return "Close failed, Sir."
 
-        # System
+        # System controls
         if action == "system":
             return self._handle_system(target, command)
 
-        # Web AI
+        # Web AI (Claude, ChatGPT, Gemini via Selenium)
         if action == "web_ai":
             try:
                 params    = routed.get("params", {}) if isinstance(routed.get("params"), dict) else {}
@@ -614,7 +654,7 @@ class JarvisCore:
                 log.error(f"Web AI: {e}")
                 return "Web AI failed, Sir."
 
-        # Scan
+        # Scanning mode action
         if action == "scan":
             try:
                 if mode_manager.current_mode != Mode.SCANNING:
@@ -624,10 +664,7 @@ class JarvisCore:
             except Exception:
                 return "Scan failed, Sir."
 
-        # ------------------------------------------------------------------
         # Phishing / URL check
-        # If user spoke "check url" without the URL, open the keyboard GUI.
-        # ------------------------------------------------------------------
         if action == "phishing_check" or "phishing" in cmd_lower or "check url" in cmd_lower:
             try:
                 url = None
@@ -641,10 +678,9 @@ class JarvisCore:
                     if m:
                         url = m.group(0)
 
-                # No URL spoken — request it via the SecurityInputDialog
                 if not url:
                     self._request_security_input("url")
-                    return ""   # silence — dialog prompt will speak
+                    return ""
 
                 self.gui.set_status("Analyzing URL...")
                 try:
@@ -653,7 +689,6 @@ class JarvisCore:
                     is_online = False
                 result = phishing.analyze(url, deep_check=is_online)
 
-                # Push result to the dialog if it is currently showing
                 try:
                     if isinstance(result, dict):
                         self.gui.show_security_result(result)
@@ -667,7 +702,7 @@ class JarvisCore:
                     risk    = result.get("risk_score", 0)
                     verdict = _to_str(result.get("verdict", ""))
                     reasons = result.get("reasons", [])
-                    msg = f"Risk score {risk} out of 100, Sir. {verdict}"
+                    msg     = f"Risk score {risk} out of 100, Sir. {verdict}"
                     if reasons and risk >= 40 and isinstance(reasons, list) and len(reasons) > 0:
                         msg += f" Issue: {_to_str(reasons[0])}."
                     return msg
@@ -676,10 +711,7 @@ class JarvisCore:
                 log.error(f"Phishing: {e}")
                 return "URL check failed, Sir."
 
-        # ------------------------------------------------------------------
         # Password strength + breach check
-        # Passwords must never be spoken aloud — always use the GUI input.
-        # ------------------------------------------------------------------
         if (action == "check_password"
                 or "check password" in cmd_lower
                 or "password strength" in cmd_lower
@@ -691,14 +723,11 @@ class JarvisCore:
                 log.error(f"Password check request: {e}")
                 return "Couldn't open password check panel, Sir."
 
-        # ------------------------------------------------------------------
         # Email breach check
-        # ------------------------------------------------------------------
         if (action == "check_email"
                 or "check email" in cmd_lower
                 or "email breach" in cmd_lower):
             try:
-                # Try to find an email address already in the command
                 email_match = re.search(
                     r'[\w.\-+]+@[\w.\-]+\.[a-zA-Z]{2,}', command
                 )
@@ -706,7 +735,6 @@ class JarvisCore:
                     email  = email_match.group(0)
                     result = security_mode.check_email_breach(email)
                     return _safe_dict_get(result, "message", "Check done, Sir.")
-                # No email in command — request via GUI
                 self._request_security_input("email")
                 return "Please type the email address in the input panel, Sir."
             except Exception as e:
@@ -730,7 +758,7 @@ class JarvisCore:
             except Exception:
                 return "News unavailable, Sir."
 
-        # Math/Wolfram
+        # Math / Wolfram
         if action in ("math", "wolfram"):
             try:
                 result = wolfram.ask(command)
@@ -758,14 +786,14 @@ class JarvisCore:
                 log.error(f"Search: {e}")
                 return "Search failed, Sir."
 
-        # Image gen
+        # Image generation
         if action == "generate_image":
             try:
                 prompt = target or command
                 self.gui.set_status("Generating images...")
                 result = image_gen.start(
                     prompt=prompt,
-                    on_ready=lambda p: log.info(f"Image: {p}"),
+                    on_ready=lambda p: log.info(f"Image ready: {p}"),
                     on_speak=self.speak,
                 )
                 return _safe_dict_get(result, "message", "")
@@ -786,7 +814,7 @@ class JarvisCore:
             except Exception:
                 return "Done, Sir."
 
-        # Music
+        # Music / Spotify
         if action in ("music", "spotify", "play"):
             try:
                 if "pause" in cmd_lower:
@@ -819,7 +847,7 @@ class JarvisCore:
             except Exception:
                 return "WhatsApp failed, Sir."
 
-        # Save data
+        # Personal data save
         if action == "save_data":
             try:
                 personal_data_extractor.trigger(on_speak=self.speak)
@@ -831,7 +859,7 @@ class JarvisCore:
         if action == "clear_data":
             return "Sir, to clear memory, say 'yes clear all memory' to confirm."
 
-        # Recall
+        # Recall from memory
         if action == "recall":
             try:
                 results = memory.recall(target or command)
@@ -844,7 +872,7 @@ class JarvisCore:
             except Exception:
                 return "Recall failed, Sir."
 
-        # Vault
+        # Vault save (Companion mode only)
         if action == "vault_save":
             if mode_manager.current_mode != Mode.COMPANION:
                 return "Vault access needs Companion mode, Sir."
@@ -854,6 +882,7 @@ class JarvisCore:
             except Exception:
                 return "Vault save failed, Deep."
 
+        # Vault recall (Companion mode only)
         if action == "vault_recall":
             if mode_manager.current_mode != Mode.COMPANION:
                 return "Vault access needs Companion mode, Sir."
@@ -865,7 +894,7 @@ class JarvisCore:
             except Exception:
                 return "Vault recall failed, Deep."
 
-        # General chat (default)
+        # Default: general chat
         return self._handle_general_chat(command, eq_result)
 
     # =========================================================
@@ -892,11 +921,15 @@ class JarvisCore:
         target_lower = _to_str(target).lower().strip()
 
         mode_map = {
-            "neural": Mode.NEURAL, "default": Mode.NEURAL, "normal": Mode.NEURAL,
-            "security": Mode.SECURITY,
-            "scanning": Mode.SCANNING, "scan": Mode.SCANNING,
+            "neural":    Mode.NEURAL,
+            "default":   Mode.NEURAL,
+            "normal":    Mode.NEURAL,
+            "security":  Mode.SECURITY,
+            "scanning":  Mode.SCANNING,
+            "scan":      Mode.SCANNING,
             "companion": Mode.COMPANION,
-            "gaming": Mode.GAMING, "game": Mode.GAMING,
+            "gaming":    Mode.GAMING,
+            "game":      Mode.GAMING,
         }
 
         new_mode = mode_map.get(target_lower)
@@ -905,7 +938,7 @@ class JarvisCore:
 
         self._exit_current_mode()
 
-        # Companion = password gate
+        # Companion requires password gate
         if new_mode == Mode.COMPANION:
             self._awaiting_password = True
             try:
@@ -956,6 +989,52 @@ class JarvisCore:
                 h.enter(on_speak=self.speak)
             except Exception as e:
                 log.error(f"Enter {mode}: {e}")
+
+    # =========================================================
+    #  SYSTEM CONTROL
+    # =========================================================
+    def _handle_system(self, target: str, command: str) -> str:
+        cmd = _to_str(command).lower()
+
+        try:
+            if "volume up" in cmd or "vol up" in cmd:
+                r = system.volume_up()
+            elif "volume down" in cmd or "vol down" in cmd:
+                r = system.volume_down()
+            elif "mute" in cmd and "un" not in cmd:
+                r = system.mute()
+            elif "unmute" in cmd:
+                r = system.unmute()
+            elif "brightness up" in cmd:
+                r = system.brightness_up()
+            elif "brightness down" in cmd:
+                r = system.brightness_down()
+            elif "screenshot" in cmd:
+                r = system.screenshot()
+            elif "start recording" in cmd or "record screen" in cmd:
+                r = system.start_recording()
+            elif "stop recording" in cmd:
+                r = system.stop_recording()
+            elif "lock" in cmd and "screen" in cmd:
+                confirmed = "yes" in cmd or "confirm" in cmd
+                r = system.lock_screen(confirmed=confirmed)
+            elif "bluetooth on" in cmd:
+                r = system.bluetooth_on()
+            elif "bluetooth off" in cmd:
+                r = system.bluetooth_off()
+            elif "battery" in cmd:
+                bat = system.battery_status()
+                if isinstance(bat, dict):
+                    plugged = "Plugged in." if bat.get("plugged") else "On battery."
+                    return f"Battery at {bat.get('percent', '?')}%, Sir. {plugged}"
+                return "Battery info unavailable, Sir."
+            else:
+                return "Sir, what system setting?"
+
+            return _safe_dict_get(r, "message", "Done, Sir.")
+        except Exception as e:
+            log.error(f"System control: {e}")
+            return "System control failed, Sir."
 
     # =========================================================
     #  PASSWORD FLOW
@@ -1043,24 +1122,21 @@ class JarvisCore:
                 except Exception:
                     is_online = False
 
-                # Use phishing engine for deep check; fall back to SecurityMode
                 try:
                     result = phishing.analyze(value, deep_check=is_online)
                 except Exception:
                     result = security_mode.check_url(value)
 
-                # Show result in the dialog's inline result area
                 try:
                     if isinstance(result, dict):
                         self.gui.show_security_result(result)
                 except Exception:
                     pass
 
-                # Speak verdict
                 if hasattr(phishing, "format_for_speech") and isinstance(result, dict):
                     speech = _to_str(phishing.format_for_speech(result))
                 elif isinstance(result, dict):
-                    risk   = result.get("risk_score", 0)
+                    risk    = result.get("risk_score", 0)
                     verdict = _to_str(result.get("verdict", ""))
                     speech  = f"Risk score {risk}. {verdict}"
                 else:
@@ -1070,10 +1146,8 @@ class JarvisCore:
             elif mode == "password":
                 self.gui.set_status("Analysing password...")
 
-                # Local strength check (no network needed)
                 strength_result = security_mode.password_strength(value)
 
-                # Optional remote breach check
                 breach_result = {}
                 try:
                     if net.is_online():
@@ -1081,7 +1155,6 @@ class JarvisCore:
                 except Exception:
                     pass
 
-                # Merge strength + breach into a single display dict
                 merged = dict(strength_result)
                 score  = strength_result.get("score", 0)
                 s_str  = strength_result.get("strength", "?").upper()
@@ -1114,7 +1187,6 @@ class JarvisCore:
                 self.gui.set_status("Checking email breach...")
                 result = security_mode.check_email_breach(value)
                 try:
-                    # Build a display-compatible dict
                     ok      = result.get("ok", False)
                     display = {
                         "safe":       not ok,
@@ -1135,66 +1207,12 @@ class JarvisCore:
         except Exception as e:
             log.error(f"Security input processing: {e}")
             self.speak("Something went wrong with that check, Sir.")
-        finally:
-            # Keep _awaiting_security_input True — dialog is still open
-            # showing the result.  It will be cleared when the user presses
-            # "Check Another" (which keeps dialog open) or Cancel (which
-            # triggers _on_security_input_cancelled and returns to HUD).
-            pass
 
     def _on_security_input_cancelled(self):
         """User pressed Cancel on the SecurityInputDialog."""
         self._awaiting_security_input = False
         self._security_input_mode     = "url"
         log.info("Security input cancelled — returning to main HUD.")
-        # The dialog's cancel signal has already switched the stack back to
-        # main_ui via GUI._on_security_input_cancel, so no GUI call needed here.
-
-    # =========================================================
-    #  SYSTEM CONTROL
-    # =========================================================
-    def _handle_system(self, target: str, command: str) -> str:
-        cmd = _to_str(command).lower()
-
-        try:
-            if "volume up" in cmd or "vol up" in cmd:
-                r = system.volume_up()
-            elif "volume down" in cmd or "vol down" in cmd:
-                r = system.volume_down()
-            elif "mute" in cmd and "un" not in cmd:
-                r = system.mute()
-            elif "unmute" in cmd:
-                r = system.unmute()
-            elif "brightness up" in cmd:
-                r = system.brightness_up()
-            elif "brightness down" in cmd:
-                r = system.brightness_down()
-            elif "screenshot" in cmd:
-                r = system.screenshot()
-            elif "start recording" in cmd or "record screen" in cmd:
-                r = system.start_recording()
-            elif "stop recording" in cmd:
-                r = system.stop_recording()
-            elif "lock" in cmd and "screen" in cmd:
-                confirmed = "yes" in cmd or "confirm" in cmd
-                r = system.lock_screen(confirmed=confirmed)
-            elif "bluetooth on" in cmd:
-                r = system.bluetooth_on()
-            elif "bluetooth off" in cmd:
-                r = system.bluetooth_off()
-            elif "battery" in cmd:
-                bat = system.battery_status()
-                if isinstance(bat, dict):
-                    plugged = "Plugged in." if bat.get("plugged") else "On battery."
-                    return f"Battery at {bat.get('percent', '?')}%, Sir. {plugged}"
-                return "Battery info unavailable, Sir."
-            else:
-                return "Sir, what system setting?"
-
-            return _safe_dict_get(r, "message", "Done, Sir.")
-        except Exception as e:
-            log.error(f"System control: {e}")
-            return "System control failed, Sir."
 
     # =========================================================
     #  SHUTDOWN
@@ -1239,7 +1257,7 @@ class JarvisCore:
 # =============================================================
 def main():
     def signal_handler(sig, frame):
-        log.info("Ctrl+C - shutting down...")
+        log.info("Ctrl+C — shutting down...")
         if jarvis:
             jarvis.shutdown()
         sys.exit(0)

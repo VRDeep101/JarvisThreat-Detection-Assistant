@@ -1,152 +1,147 @@
 [
   {
     "role": "user",
-    "content": "Can you open Google Chrome?",
-    "timestamp": "2026-04-21T11:52:39.591451",
-    "mode": "neural"
-  },
-  {
-    "role": "user",
-    "content": "Turn on security mode.",
-    "timestamp": "2026-04-21T11:53:17.533695",
-    "mode": "neural"
-  },
-  {
-    "role": "user",
-    "content": "Take screenshot.",
-    "timestamp": "2026-04-21T12:00:42.056109",
-    "mode": "neural"
-  },
-  {
-    "role": "user",
-    "content": "Open Google Chrome.",
-    "timestamp": "2026-04-21T12:00:53.117221",
-    "mode": "neural"
-  },
-  {
-    "role": "user",
-    "content": "Open spotify.",
-    "timestamp": "2026-04-21T12:01:03.629952",
-    "mode": "neural"
-  },
-  {
-    "role": "user",
-    "content": "Open settings.",
-    "timestamp": "2026-04-21T12:01:29.271175",
-    "mode": "neural"
-  },
-  {
-    "role": "user",
-    "content": "Close settings.",
-    "timestamp": "2026-04-21T12:01:39.043190",
-    "mode": "neural"
-  },
-  {
-    "role": "user",
-    "content": "Increase volume.",
-    "timestamp": "2026-04-21T12:01:50.361449",
-    "mode": "neural"
-  },
-  {
-    "role": "user",
-    "content": "Decrease volume.",
-    "timestamp": "2026-04-21T12:02:01.606761",
-    "mode": "neural"
-  },
-  {
-    "role": "user",
-    "content": "Reduce brightness of the windows.",
-    "timestamp": "2026-04-21T12:02:13.714768",
-    "mode": "neural"
-  },
-  {
-    "role": "user",
-    "content": "Play can we Kiss Forever.",
-    "timestamp": "2026-04-21T12:02:55.070351",
-    "mode": "neural"
-  },
-  {
-    "role": "user",
-    "content": "Close spotify.",
-    "timestamp": "2026-04-21T12:03:42.780950",
-    "mode": "neural"
-  },
-  {
-    "role": "user",
-    "content": "Turned scanning mode.",
-    "timestamp": "2026-04-21T12:04:01.433967",
-    "mode": "neural"
-  },
-  {
-    "role": "user",
-    "content": "Can nearby Wi-Fi?",
-    "timestamp": "2026-04-21T12:04:16.298014",
+    "content": "Turn on.",
+    "timestamp": "2026-04-21T14:52:37.703695",
     "mode": "scanning"
   },
   {
     "role": "user",
-    "content": "Can Wi-Fi?",
-    "timestamp": "2026-04-21T12:04:45.409056",
-    "mode": "scanning"
-  },
-  {
-    "role": "user",
-    "content": "Can nearby Wi-Fi?",
-    "timestamp": "2026-04-21T12:05:14.187095",
-    "mode": "scanning"
-  },
-  {
-    "role": "user",
-    "content": "Can nearby Wi-Fi?",
-    "timestamp": "2026-04-21T12:05:35.457630",
-    "mode": "scanning"
-  },
-  {
-    "role": "user",
-    "content": "Can nearby Wi-Fi s c a n scan nearby Wi-Fi?",
-    "timestamp": "2026-04-21T12:06:00.640535",
+    "content": "Turn on cruise security mode.",
+    "timestamp": "2026-04-21T14:53:01.681336",
     "mode": "scanning"
   },
   {
     "role": "user",
     "content": "Turn on gaming mode.",
-    "timestamp": "2026-04-21T12:06:53.201472",
-    "mode": "scanning"
+    "timestamp": "2026-04-21T14:54:08.635292",
+    "mode": "security"
   },
   {
     "role": "user",
-    "content": "Does not neural mode?",
-    "timestamp": "2026-04-21T12:07:14.279776",
+    "content": "Turn on compine in mode.",
+    "timestamp": "2026-04-21T14:54:27.309041",
     "mode": "gaming"
   },
   {
     "role": "user",
     "content": "Turn on companion mode.",
-    "timestamp": "2026-04-21T12:07:28.153200",
+    "timestamp": "2026-04-21T14:54:49.121376",
+    "mode": "gaming"
+  },
+  {
+    "role": "user",
+    "content": "Turn on complaint mode.",
+    "timestamp": "2026-04-21T15:08:31.856393",
     "mode": "neural"
   },
   {
     "role": "user",
-    "content": "Is known to Visakha?",
-    "timestamp": "2026-04-21T12:08:17.734500",
+    "content": "Turn on companion mode.",
+    "timestamp": "2026-04-21T15:08:52.163752",
+    "mode": "neural"
+  },
+  {
+    "role": "user",
+    "content": "Turn on companion mode.",
+    "timestamp": "2026-04-21T15:52:03.593537",
+    "mode": "neural"
+  },
+  {
+    "role": "user",
+    "content": "Who is my favourite person?",
+    "timestamp": "2026-04-21T15:54:31.847421",
+    "mode": "neural"
+  },
+  {
+    "role": "user",
+    "content": "Turn on companion mode.",
+    "timestamp": "2026-04-21T15:55:25.416762",
+    "mode": "neural"
+  },
+  {
+    "role": "user",
+    "content": "Turn on companion mode.",
+    "timestamp": "2026-04-21T16:11:41.446355",
+    "mode": "neural"
+  },
+  {
+    "role": "user",
+    "content": "Who is my favourite person?",
+    "timestamp": "2026-04-21T16:12:10.810952",
     "mode": "companion"
   },
   {
     "role": "user",
-    "content": "I am not feeling great.",
-    "timestamp": "2026-04-21T12:09:15.116977",
+    "content": "My favourite person is Vishakha.",
+    "timestamp": "2026-04-21T16:12:46.476211",
     "mode": "companion"
   },
   {
     "role": "user",
-    "content": "Can you play my favourite song?",
-    "timestamp": "2026-04-21T12:09:43.423245",
+    "content": "Can you tell me who is my favourite person?",
+    "timestamp": "2026-04-21T16:13:55.543970",
     "mode": "companion"
   },
   {
     "role": "user",
-    "content": "Turn on security mode.",
-    "timestamp": "2026-04-21T12:11:10.844077",
+    "content": "You do you know Vishakha.",
+    "timestamp": "2026-04-21T16:14:26.645077",
+    "mode": "companion"
+  },
+  {
+    "role": "user",
+    "content": "long term memory my favourite person is Vishakha.",
+    "timestamp": "2026-04-21T16:15:27.066009",
+    "mode": "companion"
+  },
+  {
+    "role": "user",
+    "content": "Do you know who is Vishakha?",
+    "timestamp": "2026-04-21T16:15:48.774054",
+    "mode": "companion"
+  },
+  {
+    "role": "user",
+    "content": "Turn on companion mode.",
+    "timestamp": "2026-04-21T16:24:15.157162",
+    "mode": "companion"
+  },
+  {
+    "role": "user",
+    "content": "Turn on neural mode.",
+    "timestamp": "2026-04-21T16:24:42.025492",
+    "mode": "companion"
+  },
+  
+  {
+    "role": "user",
+    "content": "Turn on companion mode.",
+    "timestamp": "2026-04-21T17:31:34.083574",
+    "mode": "neural"
+  },
+  {
+    "role": "user",
+    "content": "Who is my favourite person?",
+    "timestamp": "2026-04-21T17:31:53.550270",
+    "mode": "companion"
+  },
+  {
+    "role": "user",
+    "content": "Name the person I like.",
+    "timestamp": "2026-04-21T17:33:23.065519",
+    "mode": "companion"
+  },
+  {
+    "role": "user",
+    "content": "Name.",
+    "timestamp": "2026-04-21T17:34:55.705931",
+    "mode": "companion"
+  },
+  {
+    "role": "user",
+    "content": "Turn on neural mode.",
+    "timestamp": "2026-04-21T17:35:43.922516",
     "mode": "companion"
   }
 ]

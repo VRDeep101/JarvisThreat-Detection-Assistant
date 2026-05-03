@@ -47,10 +47,15 @@ def _get_groq():
     if _groq_client is None and GROQ_KEY:
         try:
             from groq import Groq
-            _groq_client = Groq(api_key=GROQ_KEY)
+            # Initialize with only supported parameters
+            _groq_client = Groq(
+                api_key=GROQ_KEY,
+                timeout=30.0,  # Add reasonable timeout
+            )
             log.info("Groq client ready")
         except Exception as e:
             log.error(f"Groq init failed: {e}")
+            _groq_client = None  # Explicitly set to None on failure
     return _groq_client
 
 def _get_gemini():
@@ -323,6 +328,11 @@ class Chatbot:
             return response.text.strip() if hasattr(response, "text") else ""
         
         except Exception as e:
+            err_str = str(e)
+            # Check for quota/rate limit errors
+            if "quota" in err_str.lower() or "429" in err_str:
+                log.error("Gemini quota exceeded - free tier limit hit")
+                return ""  # Silent fail, will show fallback message
             log.error(f"Gemini fallback error: {e}")
             return ""
     
